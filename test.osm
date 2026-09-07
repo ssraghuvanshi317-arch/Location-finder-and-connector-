@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  test.osm - a tiny hand-made OpenStreetMap file for testing build_tiles.py offline.
+
+  Four roads and three landmarks placed in central Delhi (inside the default bbox).
+  Layout (north is up, each block ~300 m):
+
+        City Station (railway)                Sacred Heart Cathedral
+              4                                       5
+              |  First Avenue                         |  Second Avenue
+              |                                       |
+              1 =========== Station Road ============ 2 ========== 3 .... Ridge Lane .... 7   [Riverside Park]
+                                                      |
+                                                      |  Second Avenue
+                                                      6
+
+  Node 2 is a real junction (4 branches). Nodes 1 and 3 are "name_change" points
+  (two branches with different road names). Riverside Park is an area (closed way).
+
+  Run (see README):  python build_tiles.py  with input test.osm and bbox 28.5,77.1,28.7,77.4
+-->
+<osm version="0.6" generator="hand">
+  <!-- road vertices -->
+  <node id="1" version="1" lat="28.6260" lon="77.2340"/>
+  <node id="2" version="1" lat="28.6260" lon="77.2371"/>
+  <node id="3" version="1" lat="28.6260" lon="77.2402"/>
+  <node id="4" version="1" lat="28.6287" lon="77.2340"/>
+  <node id="5" version="1" lat="28.6287" lon="77.2371"/>
+  <node id="6" version="1" lat="28.6233" lon="77.2371"/>
+  <node id="7" version="1" lat="28.6260" lon="77.2433"/>
+
+  <!-- point landmarks -->
+  <node id="50" version="1" lat="28.6282" lon="77.2336">
+    <tag k="railway" v="station"/>
+    <tag k="name" v="City Station"/>
+    <tag k="wikidata" v="Q1"/>
+  </node>
+  <node id="51" version="1" lat="28.6278" lon="77.2374">
+    <tag k="amenity" v="place_of_worship"/>
+    <tag k="religion" v="christian"/>
+    <tag k="name" v="Sacred Heart Cathedral"/>
+    <tag k="wikidata" v="Q4"/>
+  </node>
+
+  <!-- outline of an area landmark (a park just past the east end of Ridge Lane) -->
+  <node id="101" version="1" lat="28.6250" lon="77.2440"/>
+  <node id="102" version="1" lat="28.6250" lon="77.2470"/>
+  <node id="103" version="1" lat="28.6275" lon="77.2470"/>
+  <node id="104" version="1" lat="28.6275" lon="77.2440"/>
+
+  <!-- roads -->
+  <way id="1001" version="1">
+    <nd ref="4"/><nd ref="1"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="First Avenue"/>
+  </way>
+  <way id="1002" version="1">
+    <nd ref="6"/><nd ref="2"/><nd ref="5"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Second Avenue"/>
+  </way>
+  <way id="1003" version="1">
+    <nd ref="1"/><nd ref="2"/><nd ref="3"/>
+    <tag k="highway" v="tertiary"/>
+    <tag k="name" v="Station Road"/>
+  </way>
+  <way id="1004" version="1">
+    <nd ref="3"/><nd ref="7"/>
+    <tag k="highway" v="residential"/>
+    <tag k="name" v="Ridge Lane"/>
+  </way>
+
+  <!-- area landmark -->
+  <way id="2001" version="1">
+    <nd ref="101"/><nd ref="102"/><nd ref="103"/><nd ref="104"/><nd ref="101"/>
+    <tag k="leisure" v="park"/>
+    <tag k="name" v="Riverside Park"/>
+    <tag k="wikidata" v="Q2"/>
+  </way>
+</osm>

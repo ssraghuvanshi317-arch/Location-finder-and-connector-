@@ -1,0 +1,3 @@
+networkx>=3.0
+# optional, only for .osm.pbf input:
+# osmium
