@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1b3a4b">
+<title>Familiarizer</title>
+<!--
+  Familiarizer — the phone side. About 200 lines of JavaScript, no framework, no server.
+
+  What it does, once per GPS fix:
+    1. work out which zoom-14 tile it is standing in, fetch it and its 8 neighbours
+       (once; they are cached in memory for the session)
+    2. snap the position to the nearest road edge in those tiles
+    3. if the next node ahead is a junction, read that junction's precomputed
+       branches, turn each bearing into left/straight/right using the compass,
+       and speak the template
+    4. between junctions, call out landmarks within the corridor of the road you are on
+
+  All the thinking (which landmark to name, which road goes where) was done by
+  build_tiles.py and salience_pass.py on a laptop. This file only does arithmetic.
+
+  Serve it from any static host (it can live in the same R2 bucket as the tiles).
+  Needs HTTPS for geolocation and the compass. On iOS the compass needs a tap first,
+  which is what the Start button is for.
+
+  Query parameters:  ?base=https://bucket.example/  &mode=driving
+  Testing without a phone: window.app.simulate([[lat,lon],...]) replays a route.
+-->
+<style>
+  :root { color-scheme: light dark; --bg:#f4f6f7; --fg:#15232b; --card:#fff; --muted:#5d6b73; --accent:#1b3a4b; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1a20; --fg:#e6edf0; --card:#18262e; --muted:#95a5ad; --accent:#8ecae6; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 16px/1.4 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding: 14px 16px 6px; }
+  h1 { margin:0; font-size: 20px; }
+  #status { color: var(--muted); font-size: 14px; min-height: 1.4em; }
+  .row { display:flex; gap:8px; padding: 6px 16px; flex-wrap: wrap; align-items:center; }
+  input, select, button { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid #8a9aa3; background: var(--card); color: var(--fg); }
+  input { flex: 1 1 200px; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+  @media (prefers-color-scheme: dark) { button.primary { color:#0f1a20; } }
+  #now { margin: 8px 16px; padding: 14px; border-radius: 12px; background: var(--card); font-size: 20px; min-height: 3.2em; }
+  #log { list-style: none; margin: 0; padding: 0 16px 24px; }
+  #log li { padding: 8px 0; border-top: 1px solid #8a9aa333; color: var(--muted); }
+  #log li:first-child { color: var(--fg); }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Familiarizer</h1>
+  <div id="status">Idle. Set the tile URL and press Start.</div>
+</header>
+<div class="row">
+  <input id="base" placeholder="tile base URL, e.g. https://pub-xxx.r2.dev" autocapitalize="off" spellcheck="false">
+  <select id="mode"><option value="walking">walking</option><option value="driving">driving</option></select>
+</div>
+<div class="row">
+  <button id="start" class="primary">Start</button>
+  <button id="demo">Demo route</button>
+  <button id="mute">🔊</button>
+  <small id="pos"></small>
+</div>
+<div id="now">—</div>
+<ul id="log"></ul>
+
+<script>
+'use strict';
+// ------------------------------------------------------------------ tunables
+const PROFILES = {
+  walking: { lookahead: 40,  corridor: 60  },
+  driving: { lookahead: 200, corridor: 150 },
+};
+const Z = 14;
+const SNAP_MAX_M = 60;      // further than this from any road: say nothing
+const SNAP_STICKY_M = 8;    // prefer the edge we are already on unless another is this much closer
+
+// ------------------------------------------------------------------ geometry
+const rad = d => d * Math.PI / 180;
+function tileOf(lat, lon) {
+  const n = 2 ** Z, lr = rad(lat);
+  return [Math.floor((lon + 180) / 360 * n),
+          Math.floor((1 - Math.log(Math.tan(lr) + 1 / Math.cos(lr)) / Math.PI) / 2 * n)];
+}
+let frame = null;                                 // local flat frame, set on first fix
+function xy(lat, lon) {
+  if (!frame) frame = { lat0: lat, lon0: lon, kx: 111320 * Math.cos(rad(lat)), ky: 110540 };
+  return [(lon - frame.lon0) * frame.kx, (lat - frame.lat0) * frame.ky];
+}
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+const bearing = (a, b) => (Math.atan2(b[0] - a[0], b[1] - a[1]) * 180 / Math.PI + 360) % 360;
+const turn = (heading, target) => ((target - heading + 180) % 360 + 360) % 360 - 180;
+function turnWord(d) {
+  const a = Math.abs(d);
+  if (a < 30) return 'straight';
+  if (a > 150) return 'back';
+  return (d < 0 ? 'sharp left|left' : 'sharp right|right').split('|')[a > 110 ? 0 : 1];
+}
+function sideOf(heading, from, to) {
+  const hx = Math.sin(rad(heading)), hy = Math.cos(rad(heading));
+  return hx * (to[1] - from[1]) - hy * (to[0] - from[0]) > 0 ? 'left' : 'right';
+}
+function project(p, a, b) {                       // -> [tClamped, perpDist, tRaw]
+  const vx = b[0] - a[0], vy = b[1] - a[1], L2 = vx * vx + vy * vy;
+  if (!L2) return [0, dist(p, a), 0];
+  const tr = ((p[0] - a[0]) * vx + (p[1] - a[1]) * vy) / L2, t = Math.max(0, Math.min(1, tr));
+  return [t, dist(p, [a[0] + t * vx, a[1] + t * vy]), tr];
+}
+
+// ------------------------------------------------------------------ tiles -> one working graph
+const tiles = new Map();                          // "x/y" -> tile | null (missing) | 'loading'
+let G = null;                                     // merged view of every loaded tile
+let baseUrl = '';
+
+function ensureTiles(lat, lon) {
+  const [x, y] = tileOf(lat, lon);
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    const key = `${x + dx}/${y + dy}`;
+    if (tiles.has(key)) continue;
+    tiles.set(key, 'loading');
+    fetch(`${baseUrl}/${Z}/${key}.json`)
+      .then(r => r.ok ? r.json() : null)
+      .then(t => { tiles.set(key, t); rebuild(); })
+      .catch(() => tiles.set(key, null));
+  }
+}
+function rebuild() {
+  const g = { nodes: {}, edges: [], adj: {}, junctions: {}, landmarks: [], salience: {}, seenLm: new Set(), seenEdge: new Set() };
+  for (const t of tiles.values()) {
+    if (!t || t === 'loading') continue;
+    for (const [id, ll] of Object.entries(t.nodes)) g.nodes[id] = ll;
+    for (const e of t.edges) {
+      const [u, v] = e, key = u < v ? `${u}-${v}` : `${v}-${u}`;
+      if (g.seenEdge.has(key)) continue;
+      g.seenEdge.add(key); g.edges.push({ u, v, len: e[2], name: e[3] });
+    }
+    Object.assign(g.junctions, t.junctions);
+    for (const lm of t.landmarks) {
+      const key = `${lm.name}@${lm.lat},${lm.lon}`;
+      if (!g.seenLm.has(key)) { g.seenLm.add(key); g.landmarks.push(lm); }
+    }
+    if (t.salience && t.salience.junctions) Object.assign(g.salience, t.salience.junctions);
+  }
+  G = g;
+  if (!onEdge) setStatus(`${Object.keys(g.nodes).length} nodes, ${g.edges.length} edges, ${g.landmarks.length} landmarks loaded`);
+}
+const nxy = id => xy(G.nodes[id][0], G.nodes[id][1]);
+const roadName = (u, v) => { const e = G.edges.find(e => (e.u == u && e.v == v) || (e.u == v && e.v == u)); return e && e.name; };
+
+// ------------------------------------------------------------------ snapping
+let onEdge = null;                                // { u, v } oriented so v is ahead
+function snap(pos, heading) {
+  let best = null;
+  for (const e of G.edges) {
+    if (!(e.u in G.nodes) || !(e.v in G.nodes)) continue;
+    const a = nxy(e.u), b = nxy(e.v), [t, d, tr] = project(pos, a, b);
+    // distance, plus a small penalty for edges that run across our heading — breaks the
+    // tie at a shared node in favour of the road we are actually walking along
+    let score = d + (1 - Math.abs(Math.cos(rad(turn(heading, bearing(a, b)))))) * 5;
+    if (onEdge && ((e.u == onEdge.u && e.v == onEdge.v) || (e.u == onEdge.v && e.v == onEdge.u))) score -= SNAP_STICKY_M;
+    if (!best || score < best.score) best = { e, a, b, t, d, score };
+  }
+  if (!best || best.d > SNAP_MAX_M) return null;
+  // orient so that v is the node we are travelling toward
+  let { u, v } = best.e;
+  if (Math.abs(turn(heading, bearing(best.a, best.b))) > 90) [u, v] = [v, u];
+  onEdge = { u, v };
+  return onEdge;
+}
+
+// ------------------------------------------------------------------ narration
+const said = { junction: new Map(), approach: new Map(), landmark: new Set() };
+let muted = false;
+function say(text) {
+  const li = document.createElement('li'); li.textContent = text;
+  document.getElementById('log').prepend(li);
+  document.getElementById('now').textContent = text;
+  if (!muted && 'speechSynthesis' in window) {
+    const u = new SpeechSynthesisUtterance(text); u.lang = 'en-IN';
+    speechSynthesis.speak(u);
+  }
+  app.lines.push(text);
+}
+function destFor(node, branch) {
+  const s = G.salience[node];
+  if (s && s.branches && branch.to in s.branches && s.branches[branch.to] !== undefined && s.branches[branch.to] !== null) return s.branches[branch.to];
+  return branch.dest;
+}
+function junctionLine(node, cameFrom, heading) {
+  const j = G.junctions[node], s = G.salience[node];
+  const jname = (s && s.name) || j.name;
+  const count = said.junction.get(node) || 0, again = count ? ' again' : '';
+  const parts = [];
+  if (j.kind === 'name_change') {
+    const other = j.branches.find(b => b.to != cameFrom);
+    if (other) parts.push(`${roadName(cameFrom, node) || 'The road'} becomes ${other.road || 'an unnamed road'}`);
+  } else {
+    parts.push(jname ? `Approaching ${jname}${again}.` : `Approaching a junction${again}.`);
+    const branches = j.branches.filter(b => b.to != cameFrom).map(b => [turn(heading, b.bearing), b]).sort((x, y) => x[0] - y[0]);
+    for (const [d, b] of branches) {
+      const tw = turnWord(d);
+      if (tw === 'back') continue;
+      const dest = destFor(node, b);
+      parts.push(`${tw[0].toUpperCase()}${tw.slice(1)} onto ${b.road || 'an unnamed road'}${dest ? `, toward ${dest}` : ''}.`);
+    }
+  }
+  said.junction.set(node, count + 1);
+  if (parts.length) say(parts.join(' '));
+}
+function tick(lat, lon, heading) {
+  ensureTiles(lat, lon);
+  document.getElementById('pos').textContent = `${lat.toFixed(5)}, ${lon.toFixed(5)}  ${heading == null ? '' : Math.round(heading) + '°'}`;
+  if (!G || !G.edges.length || heading == null) return;
+  const prof = PROFILES[document.getElementById('mode').value];
+  const pos = xy(lat, lon), e = snap(pos, heading);
+  if (!e) { setStatus('off the mapped roads'); return; }
+  const a = nxy(e.u), b = nxy(e.v), [tMe] = project(pos, a, b), L = dist(a, b);
+  setStatus(`on ${roadName(e.u, e.v) || 'an unnamed road'}`);
+  // corridor: landmarks along this edge, ahead of us
+  for (const lm of G.landmarks) {
+    if ((lm.class || '').startsWith('place=') || lm.score < 2 || said.landmark.has(lm.name)) continue;
+    const p = xy(lm.lat, lm.lon), [t, d, tr] = project(p, a, b);
+    if (d <= prof.corridor && t > tMe && tr <= 1.05 && (t - tMe) * L <= prof.lookahead) {
+      said.landmark.add(lm.name);
+      say(`${lm.name} coming up on your ${sideOf(heading, pos, p)}.`);
+    }
+  }
+  // junction ahead
+  if (G.junctions[e.v] && dist(pos, b) <= prof.lookahead && said.approach.get(e.v) != e.u) {
+    said.approach.set(e.v, e.u);
+    junctionLine(e.v, e.u, heading);
+  }
+}
+
+// ------------------------------------------------------------------ sensors
+let compass = null, lastFix = null;
+function onOrientation(ev) {
+  if (ev.webkitCompassHeading != null) compass = ev.webkitCompassHeading;          // iOS
+  else if (ev.absolute && ev.alpha != null) compass = (360 - ev.alpha) % 360;      // Android
+}
+function headingFrom(c) {
+  if (compass != null) return compass;
+  if (c.heading != null && !Number.isNaN(c.heading) && c.speed > 0.5) return c.heading;
+  if (lastFix) { const a = xy(lastFix[0], lastFix[1]), b = xy(c.latitude, c.longitude); if (dist(a, b) > 5) return bearing(a, b); }
+  return null;
+}
+function setStatus(t) { document.getElementById('status').textContent = t; }
+
+async function start() {
+  baseUrl = document.getElementById('base').value.replace(/\/+$/, '');
+  try { localStorage.setItem('tileBase', baseUrl); } catch (e) {}
+  if (!baseUrl) { setStatus('Set the tile base URL first.'); return; }
+  if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+    try { await DeviceOrientationEvent.requestPermission(); } catch (e) {}
+  }
+  window.addEventListener('deviceorientationabsolute', onOrientation, true);
+  window.addEventListener('deviceorientation', onOrientation, true);
+  if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance('Familiarizer started.'));
+  setStatus('waiting for GPS…');
+  navigator.geolocation.watchPosition(p => {
+    const c = p.coords, h = headingFrom(c);
+    tick(c.latitude, c.longitude, h);
+    lastFix = [c.latitude, c.longitude];
+  }, err => setStatus('GPS error: ' + err.message), { enableHighAccuracy: true, maximumAge: 1000, timeout: 15000 });
+}
+
+// ------------------------------------------------------------------ simulation (tests, demo)
+const app = {
+  lines: [], tick, tileOf,
+  ready: () => new Promise(res => { const i = setInterval(() => { if (G && G.edges.length) { clearInterval(i); res(G); } }, 20); }),
+  async simulate(route, stepM = 8, delayMs = 0) {
+    baseUrl = document.getElementById('base').value.replace(/\/+$/, '');
+    ensureTiles(route[0][0], route[0][1]);
+    await app.ready();
+    for (let i = 0; i + 1 < route.length; i++) {
+      const a = xy(...route[i]), b = xy(...route[i + 1]), L = dist(a, b), h = bearing(a, b), n = Math.max(1, Math.floor(L / stepM));
+      for (let k = 0; k <= n; k++) {
+        const t = Math.min(1, k * stepM / L);
+        const lat = route[i][0] + t * (route[i + 1][0] - route[i][0]), lon = route[i][1] + t * (route[i + 1][1] - route[i][1]);
+        tick(lat, lon, h);
+        if (delayMs) await new Promise(r => setTimeout(r, delayMs));
+      }
+    }
+    return app.lines;
+  },
+};
+window.app = app;
+
+// Demo walk over test.osm: west end of Station Road -> junction 2 -> north up Second Avenue
+const DEMO = [[28.6260, 77.2340], [28.6260, 77.2371], [28.6287, 77.2371]];
+
+document.getElementById('start').onclick = start;
+document.getElementById('demo').onclick = () => app.simulate(DEMO, 8, 150);
+document.getElementById('mute').onclick = e => { muted = !muted; e.target.textContent = muted ? '🔇' : '🔊'; };
+(() => {
+  const q = new URLSearchParams(location.search);
+  let b = q.get('base'); try { b = b || localStorage.getItem('tileBase'); } catch (e) {}
+  if (b) document.getElementById('base').value = b;
+  if (q.get('mode')) document.getElementById('mode').value = q.get('mode');
+})();
+</script>
+</body>
+</html>

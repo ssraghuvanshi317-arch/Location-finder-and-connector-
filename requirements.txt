@@ -1,0 +1,7 @@
+networkx>=3.0
+# .osm.pbf input:
+osmium
+# salience_pass.py:
+anthropic
+# tests/test_app.py:
+playwright
