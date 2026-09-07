@@ -122,7 +122,7 @@ def read_osm_pbf(path, bbox):
 
     class H(osmium.SimpleHandler):
         def node(self, n):
-            if in_bbox(n.location.lat, n.location.lon, bbox):
+            if n.location.valid() and in_bbox(n.location.lat, n.location.lon, bbox):
                 tags = {t.k: t.v for t in n.tags}
                 nodes[n.id] = (n.location.lat, n.location.lon, tags)
 
@@ -218,6 +218,8 @@ def write_tiles(rm: RoadMap, road_class, out_dir):
         if not kind:
             continue
         n_j += 1
+        if n_j % 5000 == 0:
+            print(f"  ... {n_j} junctions done", flush=True)
         branches = []
         for nbr in G.neighbors(n):
             road, dest = rm.destination_for(n, nbr, prof)

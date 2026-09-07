@@ -40,7 +40,9 @@ Tiles are plain files with predictable names, so any static host works. Upload t
 
 ## Known gaps
 
-- `build_tiles.py` has not yet been run against a real `.pbf`; expect a small fix on first run.
+- `build_tiles.py` has been run on a `.pbf` converted from `test.osm` and on a synthetic
+  Delhi-sized city (22,500 junctions, about 18 s), but not yet on a real Geofabrik extract.
+  Expect a small fix on first run.
 - Landmarks mapped as multipolygon relations (some large parks) are skipped.
 - The "toward X" walk is conservative: a landmark just past the end of a road is not picked
   up. The lazy LLM salience pass (the `salience` field in each tile) and a neighbourhood-name

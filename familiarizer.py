@@ -26,6 +26,7 @@ that's deliberate; the LLM's job is batch salience ranking and "tell me more".
 import argparse
 import math
 import sys
+from collections import defaultdict
 import networkx as nx
 
 # ---------------------------------------------------------------------------
@@ -125,6 +126,30 @@ def project_on_segment(p, a, b):
 
 
 # ---------------------------------------------------------------------------
+# Spatial index so landmark lookups don't scan every landmark for every segment.
+# A city bbox has thousands of landmarks and tens of thousands of segments walked;
+# a plain scan is billions of projections. A coarse grid makes it near-constant.
+# ---------------------------------------------------------------------------
+class LandmarkIndex:
+    def __init__(self, landmarks, cell=250.0):
+        self.cell = cell
+        self.cells = defaultdict(list)
+        for lm in landmarks:
+            self.cells[self._key(lm["xy"])].append(lm)
+
+    def _key(self, p):
+        return (math.floor(p[0] / self.cell), math.floor(p[1] / self.cell))
+
+    def near_segment(self, a, b, radius):
+        """Every landmark whose cell overlaps the segment's bbox grown by `radius`."""
+        kx0, ky0 = self._key((min(a[0], b[0]) - radius, min(a[1], b[1]) - radius))
+        kx1, ky1 = self._key((max(a[0], b[0]) + radius, max(a[1], b[1]) + radius))
+        for i in range(kx0, kx1 + 1):
+            for j in range(ky0, ky1 + 1):
+                yield from self.cells.get((i, j), ())
+
+
+# ---------------------------------------------------------------------------
 # Graph model
 # ---------------------------------------------------------------------------
 class RoadMap:
@@ -138,6 +163,7 @@ class RoadMap:
         self.G = G
         self.landmarks = landmarks
         self.frame = frame
+        self.index = LandmarkIndex(landmarks)
 
     # ---- junction detection -------------------------------------------------
     def edge_name(self, u, v):
@@ -187,7 +213,7 @@ class RoadMap:
         found = {}
         for a, b in zip(path, path[1:]):
             axy, bxy = self.G.nodes[a]["xy"], self.G.nodes[b]["xy"]
-            for lm in self.landmarks:
+            for lm in self.index.near_segment(axy, bxy, corridor):
                 t, d, t_raw = project_on_segment(lm["xy"], axy, bxy)
                 if d <= corridor and -0.05 <= t_raw <= 1.05 and lm["name"] not in found:
                     found[lm["name"]] = lm
@@ -204,7 +230,7 @@ class RoadMap:
         axy, bxy = self.G.nodes[u]["xy"], self.G.nodes[v]["xy"]
         t_me, _, _ = project_on_segment(pos_xy, axy, bxy)
         out = []
-        for lm in self.landmarks:
+        for lm in self.index.near_segment(axy, bxy, prof["corridor"]):
             t, d, t_raw = project_on_segment(lm["xy"], axy, bxy)
             if d <= prof["corridor"] and t > t_me and t_raw <= 1.05:
                 along = (t - t_me) * dist(axy, bxy)
