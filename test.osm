@@ -2,7 +2,7 @@
 <!--
   test.osm - a tiny hand-made OpenStreetMap file for testing build_tiles.py offline.
 
-  Four roads and three landmarks placed in central Delhi (inside the default bbox).
+  Four roads, four landmarks and one neighbourhood name placed in central Delhi (inside the default bbox).
   Layout (north is up, each block ~300 m):
 
         City Station (railway)                Sacred Heart Cathedral
@@ -15,7 +15,9 @@
                                                       6
 
   Node 2 is a real junction (4 branches). Nodes 1 and 3 are "name_change" points
-  (two branches with different road names). Riverside Park is an area (closed way).
+  (two branches with different road names). Riverside Park is an area (closed way),
+  Civic Hospital (south side of Station Road, west of 2) is a multipolygon relation,
+  and Lodhi Colony is a place=neighbourhood node 500 m south of node 6.
 
   Run (see README):  python build_tiles.py  with input test.osm and bbox 28.5,77.1,28.7,77.4
 -->
@@ -41,6 +43,18 @@
     <tag k="name" v="Sacred Heart Cathedral"/>
     <tag k="wikidata" v="Q4"/>
   </node>
+
+  <!-- a neighbourhood name, 500 m south of the end of Second Avenue (no landmark there) -->
+  <node id="52" version="1" lat="28.6188" lon="77.2371">
+    <tag k="place" v="neighbourhood"/>
+    <tag k="name" v="Lodhi Colony"/>
+  </node>
+
+  <!-- outline of a hospital campus, drawn as a multipolygon relation (untagged outer ring) -->
+  <node id="111" version="1" lat="28.6254" lon="77.2350"/>
+  <node id="112" version="1" lat="28.6254" lon="77.2358"/>
+  <node id="113" version="1" lat="28.6259" lon="77.2358"/>
+  <node id="114" version="1" lat="28.6259" lon="77.2350"/>
 
   <!-- outline of an area landmark (a park just past the east end of Ridge Lane) -->
   <node id="101" version="1" lat="28.6250" lon="77.2440"/>
@@ -70,6 +84,11 @@
     <tag k="name" v="Ridge Lane"/>
   </way>
 
+  <!-- untagged outer ring of the hospital relation -->
+  <way id="2002" version="1">
+    <nd ref="111"/><nd ref="112"/><nd ref="113"/><nd ref="114"/><nd ref="111"/>
+  </way>
+
   <!-- area landmark -->
   <way id="2001" version="1">
     <nd ref="101"/><nd ref="102"/><nd ref="103"/><nd ref="104"/><nd ref="101"/>
@@ -77,4 +96,12 @@
     <tag k="name" v="Riverside Park"/>
     <tag k="wikidata" v="Q2"/>
   </way>
+
+  <!-- area landmark as a multipolygon relation -->
+  <relation id="3001" version="1">
+    <member type="way" ref="2002" role="outer"/>
+    <tag k="type" v="multipolygon"/>
+    <tag k="amenity" v="hospital"/>
+    <tag k="name" v="Civic Hospital"/>
+  </relation>
 </osm>

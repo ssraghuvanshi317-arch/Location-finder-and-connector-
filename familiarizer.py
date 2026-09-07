@@ -46,7 +46,19 @@ CLASS_WEIGHTS = {
     ("historic", "*"): 6, ("amenity", "school"): 3, ("amenity", "cinema"): 4,
     ("shop", "mall"): 6, ("amenity", "restaurant"): 1, ("amenity", "cafe"): 1,
     ("shop", "*"): 0.5, ("amenity", "atm"): 0, ("amenity", "bank"): 1,
+    # Neighbourhood names are how locals actually give directions ("toward Lajpat Nagar").
+    # They are destinations, never corridor call-outs (see corridor_ahead).
+    ("place", "neighbourhood"): 5, ("place", "suburb"): 5, ("place", "quarter"): 5,
+    ("place", "locality"): 4, ("place", "village"): 4, ("place", "town"): 5,
 }
+
+# Multiples of the profile's corridor width used by the "toward X" fallbacks.
+END_RADIUS_X = 4      # landmark sitting just past the end of the walked road
+PLACE_RADIUS_M = 1000  # nearest neighbourhood name to the end of the walked road
+
+
+def is_place(lm):
+    return (lm.get("class") or "").startswith("place=")
 
 
 def salience(tags, area_m2=0.0):
@@ -219,11 +231,52 @@ class RoadMap:
                     found[lm["name"]] = lm
         return sorted(found.values(), key=lambda l: -l["score"])
 
+    def landmarks_beyond(self, path, radius):
+        """
+        Landmarks within `radius` of the far end of the walked path that lie *ahead*
+        (in the direction of the last segment). Catches "the park is just past where
+        Ridge Lane ends", which the corridor test misses.
+        """
+        if len(path) < 2:
+            return []
+        a, b = self.G.nodes[path[-2]]["xy"], self.G.nodes[path[-1]]["xy"]
+        hx, hy = b[0] - a[0], b[1] - a[1]
+        out = []
+        for lm in self.index.near_segment(b, b, radius):
+            dx, dy = lm["xy"][0] - b[0], lm["xy"][1] - b[1]
+            if dist(lm["xy"], b) <= radius and hx * dx + hy * dy >= 0:
+                out.append(lm)
+        return sorted(out, key=lambda l: -l["score"])
+
+    def nearest_place(self, node, radius):
+        """Closest neighbourhood/suburb name to a node, or None."""
+        p = self.G.nodes[node]["xy"]
+        best, best_d = None, radius
+        for lm in self.index.near_segment(p, p, radius):
+            if is_place(lm):
+                d = dist(lm["xy"], p)
+                if d < best_d:
+                    best, best_d = lm, d
+        return best["name"] if best else None
+
     def destination_for(self, junction, first, prof):
+        """
+        Road name and the best "toward X" for the branch junction->first, tried in order:
+          1. most salient landmark alongside the walked road
+          2. a named junction (circle / chowk) reached along it
+          3. a salient landmark just past where the walk stopped
+          4. the nearest neighbourhood name to where the walk stopped
+        """
         path, road, next_named = self.walk_branch(junction, first, prof["branch_walk"])
-        lms = self.landmarks_along(path, prof["corridor"] * 2)
-        best = lms[0]["name"] if lms and lms[0]["score"] >= 4 else None
-        return road, best or next_named
+        lms = [l for l in self.landmarks_along(path, prof["corridor"] * 2) if not is_place(l)]
+        if lms and lms[0]["score"] >= 4:
+            return road, lms[0]["name"]
+        if next_named:
+            return road, next_named
+        beyond = [l for l in self.landmarks_beyond(path, prof["corridor"] * END_RADIUS_X) if not is_place(l)]
+        if beyond and beyond[0]["score"] >= 4:
+            return road, beyond[0]["name"]
+        return road, self.nearest_place(path[-1], PLACE_RADIUS_M)
 
     # ---- corridor landmarks on the current edge, ahead of the user --------------
     def corridor_ahead(self, u, v, pos_xy, heading, prof):
@@ -231,6 +284,8 @@ class RoadMap:
         t_me, _, _ = project_on_segment(pos_xy, axy, bxy)
         out = []
         for lm in self.index.near_segment(axy, bxy, prof["corridor"]):
+            if is_place(lm):
+                continue  # "Lajpat Nagar coming up on your left" is not a thing
             t, d, t_raw = project_on_segment(lm["xy"], axy, bxy)
             if d <= prof["corridor"] and t > t_me and t_raw <= 1.05:
                 along = (t - t_me) * dist(axy, bxy)

@@ -82,15 +82,23 @@ def latlon_to_tile(lat, lon, z=ZOOM):
 # ---------------------------------------------------------------------------
 # Readers — both produce the same three dicts:
 #   nodes {id: (lat, lon, tags)}   ways {id: (refs, tags)}
+#   relations {id: (members, tags)}   members = [(type, ref, role), ...]  (multipolygons only)
 # ---------------------------------------------------------------------------
 def in_bbox(lat, lon, bbox):
     return bbox[0] <= lat <= bbox[2] and bbox[1] <= lon <= bbox[3]
 
 
+def _keep_relation(members, tags, ways):
+    """A named multipolygon landmark whose outline we actually have."""
+    return (tags.get("type") == "multipolygon" and tags.get("name")
+            and any(k in tags for k in LANDMARK_KEYS)
+            and any(t == "way" and r in ways for t, r, _ in members))
+
+
 def read_osm_xml(path, bbox):
     """Stdlib parser for small .osm files. Good for tests; too slow for a country."""
     import xml.etree.ElementTree as ET
-    nodes, ways = {}, {}
+    nodes, ways, relations = {}, {}, {}
     for _, el in ET.iterparse(path, events=("end",)):
         if el.tag == "node":
             lat, lon = float(el.get("lat")), float(el.get("lon"))
@@ -104,7 +112,13 @@ def read_osm_xml(path, bbox):
             if any(r in nodes for r in refs):
                 ways[int(el.get("id"))] = (refs, tags)
             el.clear()
-    return nodes, ways
+        elif el.tag == "relation":
+            members = [(m.get("type"), int(m.get("ref")), m.get("role") or "") for m in el.findall("member")]
+            tags = {t.get("k"): t.get("v") for t in el.findall("tag")}
+            if _keep_relation(members, tags, ways):
+                relations[int(el.get("id"))] = (members, tags)
+            el.clear()
+    return nodes, ways, relations
 
 
 def read_osm_pbf(path, bbox):
@@ -118,7 +132,8 @@ def read_osm_pbf(path, bbox):
     except ImportError:
         sys.exit("pip install osmium   (then re-run)")
 
-    nodes, ways = {}, {}
+    nodes, ways, relations = {}, {}, {}
+    TYPE = {"n": "node", "w": "way", "r": "relation"}
 
     class H(osmium.SimpleHandler):
         def node(self, n):
@@ -131,14 +146,33 @@ def read_osm_pbf(path, bbox):
             if any(r in nodes for r in refs):
                 ways[w.id] = (refs, {t.k: t.v for t in w.tags})
 
+        def relation(self, r):
+            tags = {t.k: t.v for t in r.tags}
+            if tags.get("type") != "multipolygon":
+                return
+            members = [(TYPE.get(m.type, m.type), m.ref, m.role) for m in r.members]
+            if _keep_relation(members, tags, ways):
+                relations[r.id] = (members, tags)
+
     H().apply_file(path)
-    return nodes, ways
+    return nodes, ways, relations
 
 
 # ---------------------------------------------------------------------------
 # Build the road graph + landmark list, exactly the shape familiarizer.RoadMap expects
 # ---------------------------------------------------------------------------
-def build(nodes, ways, bbox):
+def _area_landmark(tags, pts, frame, landmarks):
+    """Centroid + shoelace area of an outline given as metric points."""
+    if len(pts) < 3:
+        return
+    cx = sum(p[0] for p in pts) / len(pts)
+    cy = sum(p[1] for p in pts) / len(pts)
+    area = 0.5 * abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1]
+                         - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts))))
+    landmarks.append(_landmark(tags, (cx, cy), frame, area))
+
+
+def build(nodes, ways, relations, bbox):
     frame = Frame((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
     G = nx.Graph()
     landmarks = []
@@ -165,15 +199,20 @@ def build(nodes, ways, bbox):
                     G.nodes[r]["name"] = name
 
         elif tags.get("name") and any(k in tags for k in LANDMARK_KEYS):
-            # An *area* landmark (park, hospital campus, mall). Centroid + shoelace area.
+            # An *area* landmark drawn as one closed way (park, hospital campus, mall).
             pts = [frame.xy(nodes[r][0], nodes[r][1]) for r in refs if r in nodes]
-            if len(pts) < 3:
-                continue
-            cx = sum(p[0] for p in pts) / len(pts)
-            cy = sum(p[1] for p in pts) / len(pts)
-            area = 0.5 * abs(sum(pts[i][0] * pts[(i + 1) % len(pts)][1]
-                                 - pts[(i + 1) % len(pts)][0] * pts[i][1] for i in range(len(pts))))
-            landmarks.append(_landmark(tags, (cx, cy), frame, area))
+            _area_landmark(tags, pts, frame, landmarks)
+
+    # Area landmarks drawn as multipolygon relations (big parks, campuses). The outer
+    # rings are untagged member ways. Rings split across several ways are concatenated
+    # in member order, which is exact when the pieces are listed in sequence and a fair
+    # approximation otherwise; the centroid is what matters for narration.
+    for rid, (members, tags) in relations.items():
+        pts = []
+        for mtype, ref, role in members:
+            if mtype == "way" and role in ("outer", "") and ref in ways:
+                pts.extend(frame.xy(nodes[r][0], nodes[r][1]) for r in ways[ref][0] if r in nodes)
+        _area_landmark(tags, pts, frame, landmarks)
 
     # Point landmarks (a node with a name + a landmark tag)
     for nid, (lat, lon, tags) in nodes.items():
@@ -258,7 +297,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
 
     reader = read_osm_pbf if a.input.endswith(".pbf") else read_osm_xml
-    nodes, ways = reader(a.input, a.bbox)
-    print(f"read {len(nodes)} nodes, {len(ways)} ways inside bbox")
-    rm, road_class = build(nodes, ways, a.bbox)
+    nodes, ways, relations = reader(a.input, a.bbox)
+    print(f"read {len(nodes)} nodes, {len(ways)} ways, {len(relations)} multipolygon landmarks inside bbox")
+    rm, road_class = build(nodes, ways, relations, a.bbox)
     write_tiles(rm, road_class, a.out)
